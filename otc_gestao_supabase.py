@@ -17,6 +17,8 @@ st.set_page_config(
 )
 
 TABLE_NAME = "trades"
+SETTINGS_TABLE = "settings"
+SETTINGS_ID = 1  # usamos o registro fixo id=1
 
 
 # =========================
@@ -91,6 +93,101 @@ def sb_delete_by_id(row_id: str):
 
 
 # =========================
+# SETTINGS (Supabase) - salvar a coluna lateral
+# =========================
+def sb_get_settings() -> dict:
+    """
+    Lê settings (id=1) do Supabase. Você já criou no SQL.
+    """
+    url, key = _get_supabase_config()
+    endpoint = f"{url}/rest/v1/{SETTINGS_TABLE}"
+    params = {"select": "*", "id": f"eq.{SETTINGS_ID}", "limit": 1}
+    r = requests.get(endpoint, headers=_sb_headers(key), params=params, timeout=20)
+    if r.status_code >= 300:
+        raise RuntimeError(f"Erro Supabase SETTINGS SELECT: {r.status_code} - {r.text}")
+    data = r.json()
+    if isinstance(data, list) and len(data) > 0:
+        return data[0]
+    return {}
+
+
+def sb_save_settings(payload: dict):
+    """
+    Atualiza settings (id=1). Usamos PATCH porque o registro (id=1) existe.
+    """
+    url, key = _get_supabase_config()
+    endpoint = f"{url}/rest/v1/{SETTINGS_TABLE}"
+    params = {"id": f"eq.{SETTINGS_ID}"}
+
+    payload = dict(payload)
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    r = requests.patch(
+        endpoint,
+        headers=_sb_headers(key, prefer_return=True),
+        params=params,
+        json=payload,
+        timeout=20,
+    )
+
+    # alguns setups retornam 204 em patch sem representation; aqui pedimos representation,
+    # então o comum é 200. Mas vamos aceitar 2xx em geral.
+    if r.status_code < 200 or r.status_code >= 300:
+        raise RuntimeError(f"Erro Supabase SETTINGS UPDATE: {r.status_code} - {r.text}")
+
+    return True
+
+
+def ensure_session_defaults_from_supabase(force_reload: bool = False):
+    """
+    Carrega valores do Supabase para o st.session_state (para a lateral segurar).
+    - force_reload=True: recarrega mesmo se já existir na sessão.
+    """
+    defaults_fallback = {
+        "banca": 623.92,
+        "payout_pct": 88.0,
+        "entrada_pct": 2.0,
+        "meta_pct": 10.0,
+        "stop_pct": 10.0,
+        "banca_base_mes": 623.92,
+    }
+
+    try:
+        s = sb_get_settings() or {}
+    except Exception as e:
+        # se der erro, só usa fallback e continua o app
+        s = {}
+        st.sidebar.warning(f"Não consegui carregar configurações do Supabase: {e}")
+
+    # pega do banco ou usa fallback
+    banca_db = float(s.get("banca", defaults_fallback["banca"]))
+    payout_db = float(s.get("payout_pct", defaults_fallback["payout_pct"]))
+    entrada_db = float(s.get("entrada_pct", defaults_fallback["entrada_pct"]))
+    meta_db = float(s.get("meta_pct", defaults_fallback["meta_pct"]))
+    stop_db = float(s.get("stop_pct", defaults_fallback["stop_pct"]))
+    banca_base_db = float(s.get("banca_base_mes", banca_db))
+
+    desired = {
+        "banca": banca_db,
+        "payout_pct": payout_db,
+        "entrada_pct": entrada_db,
+        "meta_pct": meta_db,
+        "stop_pct": stop_db,
+        "banca_base_mes": banca_base_db,
+    }
+
+    for k, v in desired.items():
+        if force_reload or (k not in st.session_state):
+            st.session_state[k] = float(v)
+
+    # também inicializa os “espelhos” do slider/input sem gerar warning
+    if force_reload or ("entrada_pct_slider" not in st.session_state):
+        st.session_state.entrada_pct_slider = float(st.session_state["entrada_pct"])
+    if force_reload or ("entrada_pct_input" not in st.session_state):
+        st.session_state.entrada_pct_input = float(st.session_state["entrada_pct"])
+
+
+# =========================
 # Utilidades
 # =========================
 def brl(v: float) -> str:
@@ -129,7 +226,6 @@ def now_utc_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-# ✅ CORRIGIDO: retorna início/fim do dia com timezone UTC (aware)
 def today_range_local():
     now = datetime.now(timezone.utc)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -150,22 +246,18 @@ def load_trades_cached():
     raw = sb_select_all()
     df = pd.DataFrame(raw if raw else [])
 
-    # Garantir colunas
     needed = ["id", "timestamp", "stake", "stake_1", "payout", "result", "profit", "is_g1"]
     for c in needed:
         if c not in df.columns:
             df[c] = None
 
     if len(df) > 0:
-        # ✅ CORRIGIDO: timestamp sempre vira UTC timezone-aware
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-
         df["stake"] = pd.to_numeric(df["stake"], errors="coerce").fillna(0.0)
         df["stake_1"] = pd.to_numeric(df["stake_1"], errors="coerce").fillna(0.0)
         df["payout"] = pd.to_numeric(df["payout"], errors="coerce").fillna(0.0)
         df["profit"] = pd.to_numeric(df["profit"], errors="coerce").fillna(0.0)
         df["is_g1"] = df["is_g1"].fillna(False).astype(bool)
-
         df["result"] = (
             df["result"]
             .astype(str)
@@ -184,6 +276,12 @@ def refresh_data():
 
 
 # =========================
+# 1) Carrega settings do Supabase ANTES da Sidebar
+# =========================
+ensure_session_defaults_from_supabase(force_reload=False)
+
+
+# =========================
 # Sidebar
 # =========================
 st.sidebar.title("⚙️ Configurações")
@@ -193,7 +291,7 @@ compact_mode = st.sidebar.toggle("Modo compacto (gráficos menores)", value=True
 banca = st.sidebar.number_input(
     "Banca atual (R$)",
     min_value=0.0,
-    value=float(st.session_state.get("banca", 623.92)),
+    value=float(st.session_state["banca"]),
     step=1.0,
     format="%.2f",
     key="banca",
@@ -203,7 +301,7 @@ payout_pct = st.sidebar.number_input(
     "Payout (%)",
     min_value=0.0,
     max_value=99.0,
-    value=float(st.session_state.get("payout_pct", 88.0)),
+    value=float(st.session_state["payout_pct"]),
     step=1.0,
     format="%.2f",
     key="payout_pct",
@@ -211,29 +309,19 @@ payout_pct = st.sidebar.number_input(
 
 st.sidebar.subheader("Entrada (% da banca)")
 
-if "entrada_pct" not in st.session_state:
-    st.session_state.entrada_pct = float(st.session_state.get("entrada_pct", 2.0))
-if "entrada_pct_slider" not in st.session_state:
-    st.session_state.entrada_pct_slider = float(st.session_state.entrada_pct)
-if "entrada_pct_input" not in st.session_state:
-    st.session_state.entrada_pct_input = float(st.session_state.entrada_pct)
-
-
 def _sync_from_slider():
     st.session_state.entrada_pct = float(st.session_state.entrada_pct_slider)
     st.session_state.entrada_pct_input = float(st.session_state.entrada_pct_slider)
-
 
 def _sync_from_input():
     st.session_state.entrada_pct = float(st.session_state.entrada_pct_input)
     st.session_state.entrada_pct_slider = float(st.session_state.entrada_pct_input)
 
-
 st.sidebar.slider(
     "Ajuste rápido",
     min_value=0.10,
     max_value=20.0,
-    value=float(st.session_state.entrada_pct),
+    value=float(st.session_state["entrada_pct_slider"]),
     step=0.10,
     key="entrada_pct_slider",
     on_change=_sync_from_slider,
@@ -243,20 +331,20 @@ st.sidebar.number_input(
     "Valor exato",
     min_value=0.10,
     max_value=20.0,
-    value=float(st.session_state.entrada_pct),
+    value=float(st.session_state["entrada_pct_input"]),
     step=0.10,
     format="%.2f",
     key="entrada_pct_input",
     on_change=_sync_from_input,
 )
 
-entrada_pct = float(st.session_state.entrada_pct)
+entrada_pct = float(st.session_state["entrada_pct"])
 
 meta_pct = st.sidebar.number_input(
     "Meta do dia (%)",
     min_value=0.0,
     max_value=100.0,
-    value=float(st.session_state.get("meta_pct", 10.0)),
+    value=float(st.session_state["meta_pct"]),
     step=0.5,
     format="%.2f",
     key="meta_pct",
@@ -266,7 +354,7 @@ stop_pct = st.sidebar.number_input(
     "Stop do dia (%)",
     min_value=0.0,
     max_value=100.0,
-    value=float(st.session_state.get("stop_pct", 10.0)),
+    value=float(st.session_state["stop_pct"]),
     step=0.5,
     format="%.2f",
     key="stop_pct",
@@ -277,15 +365,42 @@ st.sidebar.divider()
 banca_base_mes = st.sidebar.number_input(
     "Banca base do mês (para gráfico do mês)",
     min_value=0.0,
-    value=float(st.session_state.get("banca_base_mes", banca)),
+    value=float(st.session_state["banca_base_mes"]),
     step=1.0,
     format="%.2f",
     key="banca_base_mes",
 )
 
 st.sidebar.divider()
-if st.sidebar.button("🔄 Atualizar / sincronizar agora", type="secondary"):
-    refresh_data()
+
+# ✅ BOTÕES DA SIDEBAR (o que faltava!)
+if st.sidebar.button("💾 Salvar configurações (Supabase)", type="primary"):
+    try:
+        sb_save_settings(
+            {
+                "banca": float(st.session_state["banca"]),
+                "payout_pct": float(st.session_state["payout_pct"]),
+                "entrada_pct": float(st.session_state["entrada_pct"]),
+                "meta_pct": float(st.session_state["meta_pct"]),
+                "stop_pct": float(st.session_state["stop_pct"]),
+                "banca_base_mes": float(st.session_state["banca_base_mes"]),
+            }
+        )
+        st.sidebar.success("Configurações salvas! Agora não volta mais no F5.")
+    except Exception as e:
+        st.sidebar.error(f"Falha ao salvar configurações: {e}")
+
+col_reload, col_sync = st.sidebar.columns(2)
+
+with col_reload:
+    if st.sidebar.button("⬇️ Recarregar do Supabase", type="secondary"):
+        ensure_session_defaults_from_supabase(force_reload=True)
+        st.sidebar.success("Recarregado do Supabase.")
+        st.rerun()
+
+with col_sync:
+    if st.sidebar.button("🔄 Atualizar operações", type="secondary"):
+        refresh_data()
 
 
 # =========================
@@ -306,11 +421,9 @@ stop_val = round(banca * (stop_pct / 100.0), 2)
 entrada_sugerida = round(banca * (entrada_pct / 100.0), 2)
 lucro_por_win = round(entrada_sugerida * (payout_pct / 100.0), 2)
 
-# ✅ tudo UTC timezone-aware
 start_today, end_today = today_range_local()
 df_all["timestamp"] = pd.to_datetime(df_all["timestamp"], utc=True, errors="coerce")
 
-# Hoje
 df_today = df_all[(df_all["timestamp"] >= start_today) & (df_all["timestamp"] <= end_today)].copy()
 resultado_dia = float(df_today["profit"].sum()) if len(df_today) else 0.0
 
@@ -323,7 +436,6 @@ elif abs(resultado_dia) >= stop_val and stop_val > 0 and resultado_dia < 0:
     status_txt = "STOP DO DIA ATINGIDO (AVISO)"
     status_color = "🔴"
 
-# Semana (segunda a domingo) em UTC
 today_utc = datetime.now(timezone.utc).date()
 ws = week_start(today_utc)
 we = ws + timedelta(days=6)
@@ -335,7 +447,6 @@ df_week = df_all[(df_all["timestamp"] >= ws_dt) & (df_all["timestamp"] <= we_dt)
 resultado_semana = float(df_week["profit"].sum()) if len(df_week) else 0.0
 trades_semana = int(len(df_week))
 
-# Mês em UTC
 ms = month_start(today_utc)
 ms_dt = datetime.combine(ms, datetime.min.time()).replace(tzinfo=timezone.utc)
 
@@ -451,7 +562,6 @@ st.divider()
 # =========================
 st.subheader("📋 Operações de hoje (editar / excluir)")
 
-# ✅ usa o mesmo range UTC já calculado
 df_today = df_all[(df_all["timestamp"] >= start_today) & (df_all["timestamp"] <= end_today)].copy()
 
 if len(df_today) == 0:
@@ -662,4 +772,4 @@ st.pyplot(plot_week(df_week), use_container_width=False)
 st.markdown("### 🗓️ Mês")
 st.pyplot(plot_month_bank(df_month), use_container_width=False)
 
-st.caption("Dados sincronizados no Supabase. Use 'Atualizar / sincronizar agora' se quiser forçar refresh.")
+st.caption("Dados sincronizados no Supabase. Use 'Atualizar operações' para forçar refresh.")
